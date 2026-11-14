@@ -22,14 +22,17 @@ Dependabot for npm and GitHub Actions (weekly, into `develop`), and `concurrency
 
 ## Setup (once)
 
-1. Create the GitHub repository `prlama55/guidedlabs-ci` and push this folder:
+1. Create the GitHub repository `prlama55/guidedlabs-ci` as **public** and push this folder:
    ```bash
    git remote add origin git@github.com:prlama55/guidedlabs-ci.git
    git push -u origin main
    git tag v1 && git push origin v1
    ```
-2. If the repository is private: **Settings → Actions → General → Access →** "Accessible from repositories owned
-   by the user 'prlama55'". Without this, product runs fail with "workflow was not found".
+2. Why public: products live both in the personal account (`prlama55/...`) and in the `Guided-Labs` organization
+   (GuidedReel). A private reusable workflow can only be shared with repositories of the *same* owner
+   (Settings → Actions → General → Access), so a private copy would leave one side failing with "workflow was not
+   found". The repository holds only workflow YAML: no secrets, no product code. (Alternative: move every product
+   into the organization and keep this repository private there.)
 3. Merge each product's CI branch. Products call `prlama55/guidedlabs-ci/.github/workflows/node-ci.yml@v1`.
 
 ## Changing the flow
