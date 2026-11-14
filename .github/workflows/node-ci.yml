@@ -30,6 +30,10 @@ on:
         description: Fail on known vulnerabilities at this severity or above (low, moderate, high, critical); "off" skips the audit.
         type: string
         default: moderate
+      audit-blocking:
+        description: A failed audit fails the job; false = report only (a warning), until the product's known vulnerabilities are fixed.
+        type: boolean
+        default: true
       quick:
         description: Script for the quick job (after install and audit).
         type: string
@@ -136,7 +140,11 @@ jobs:
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci; fi
       - name: Dependency audit
         if: inputs.audit-level != 'off'
-        run: ${{ inputs.package-manager }} audit --audit-level=${{ inputs.audit-level }}
+        run: |
+          if ! ${{ inputs.package-manager }} audit --audit-level=${{ inputs.audit-level }}; then
+            if [ "${{ inputs.audit-blocking }}" = "true" ]; then exit 1; fi
+            echo "::warning title=Dependency audit::Known vulnerabilities at ${{ inputs.audit-level }} or above (report only: audit-blocking is false)"
+          fi
       - name: Postgres for the build
         if: inputs.quick-postgres
         run: |

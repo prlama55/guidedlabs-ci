@@ -49,6 +49,7 @@ git tag v2 && git push origin v2           # breaking change (inputs renamed/rem
 | `package-manager` | `pnpm` | `pnpm` or `npm` (must match the lockfile) |
 | `node-version` | `24` | |
 | `audit-level` | `moderate` | `pnpm/npm audit --audit-level`; `off` skips it |
+| `audit-blocking` | `true` | `false` turns a failed audit into a warning (while a product's known vulnerabilities are fixed) |
 | `quick` | required | script for the quick job |
 | `quick-postgres` | `false` | plain Postgres (`pgvector/pgvector:pg16`, postgres/postgres, port 5432) for the quick job |
 | `quick-timeout` | `20` | minutes |
