@@ -1,0 +1,302 @@
+# The Guided Labs CI for Node.js products (pnpm or npm, optionally Supabase and Playwright), called by each product's
+# .github/workflows/ci.yml. Same flow everywhere: pull requests into develop, stage and main, and pushes to stage and
+# main, run the same jobs; a product says what each job runs, and adds product-only jobs in its own caller.
+#
+#   quick        always: install, dependency audit, then the product's `quick` script (lint, typecheck, unit, build...)
+#   database     with `database`: a local Supabase with only Postgres, then the script (pgTAP, migrations, RLS checks)
+#   integration  with `integration`: a local Supabase (Auth, REST, Storage), then the script (tests against a database)
+#   e2e          with `e2e`: optionally a local Supabase, then the script, split over `e2e-shards` machines
+#
+# Every script runs in bash with `set -euo pipefail`. Where Supabase runs, API_URL, ANON_KEY, SERVICE_ROLE_KEY and
+# DB_URL are exported for the script (write .env.local from them). E2E scripts also get SHARD and SHARDS.
+#
+# A push to main whose commit already passed the full CI on stage (a release fast-forwards main to stage) runs only
+# `quick`, so the release starts minutes later.
+#
+# Callers grant `contents: read` and `actions: read` (the stage check reads workflow runs); nothing here needs more.
+name: Guided Labs Node CI
+
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: pnpm or npm (the lockfile in the repository must match).
+        type: string
+        default: pnpm
+      node-version:
+        type: string
+        default: "24"
+      audit-level:
+        description: Fail on known vulnerabilities at this severity or above (low, moderate, high, critical); "off" skips the audit.
+        type: string
+        default: moderate
+      quick:
+        description: Script for the quick job (after install and audit).
+        type: string
+        required: true
+      quick-postgres:
+        description: Start a plain Postgres (pgvector/pgvector:pg16, postgres/postgres on 127.0.0.1:5432) before the quick script, e.g. for a CMS build.
+        type: boolean
+        default: false
+      quick-timeout:
+        type: number
+        default: 20
+      database:
+        description: Script run against a local Supabase with only Postgres; empty = no database job.
+        type: string
+        default: ""
+      integration:
+        description: Script run against a local Supabase with Auth, REST and Storage; empty = no integration job.
+        type: string
+        default: ""
+      e2e:
+        description: End-to-end script; empty = no e2e job.
+        type: string
+        default: ""
+      e2e-supabase:
+        description: Start a full local Supabase for the e2e job.
+        type: boolean
+        default: true
+      e2e-shards:
+        description: How many machines the e2e job is split over (SHARD and SHARDS are set for the script).
+        type: number
+        default: 1
+      e2e-timeout:
+        type: number
+        default: 30
+      e2e-report-path:
+        description: Uploaded when an e2e shard fails.
+        type: string
+        default: playwright-report
+      supabase-cli-version:
+        description: Install this Supabase CLI version; empty = the project's own `supabase` dev dependency (<package-manager> exec supabase).
+        type: string
+        default: ""
+      next-cache:
+        description: Cache .next/cache between e2e runs (a faster `next build`).
+        type: boolean
+        default: false
+      skip-heavy-when-tested-on-stage:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CI: "1"
+  # Supabase's local images from GitHub's registry: the default registry limits anonymous pulls.
+  SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+
+jobs:
+  gate:
+    name: Already tested on stage?
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      tested: ${{ steps.check.outputs.tested }}
+      shards: ${{ steps.check.outputs.shards }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIP: ${{ inputs.skip-heavy-when-tested-on-stage }}
+          SHARDS: ${{ inputs.e2e-shards }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          tested=false
+          if [ "$SKIP" = "true" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            # The caller's workflow file (e.g. .github/workflows/ci.yml), whose runs on stage are looked up.
+            file=$(echo "$WORKFLOW_REF" | sed -E 's|^[^/]+/[^/]+/(.*)@.*$|\1|')
+            count=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/$(basename "$file")/runs?head_sha=$GITHUB_SHA&branch=stage&event=push&status=success&per_page=1" \
+              | jq '.total_count' || echo 0)
+            [ "${count:-0}" -gt 0 ] && tested=true
+          fi
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq -s, 1 "$SHARDS" | sed 's/^/[/; s/$/]/')" >> "$GITHUB_OUTPUT"
+          echo "Commit $GITHUB_SHA already passed full CI on stage: $tested" >> "$GITHUB_STEP_SUMMARY"
+
+  quick:
+    name: Audit, checks, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.quick-timeout }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci; fi
+      - name: Dependency audit
+        if: inputs.audit-level != 'off'
+        run: ${{ inputs.package-manager }} audit --audit-level=${{ inputs.audit-level }}
+      - name: Postgres for the build
+        if: inputs.quick-postgres
+        run: |
+          docker run -d --name ci-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 pgvector/pgvector:pg16
+          for i in $(seq 1 30); do docker exec ci-postgres pg_isready -U postgres && exit 0; sleep 2; done
+          echo "::error::Postgres did not start"; exit 1
+      - name: Checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.quick }}
+
+  database:
+    name: Database tests
+    needs: gate
+    if: inputs.database != '' && needs.gate.outputs.tested != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci; fi
+      - if: inputs.supabase-cli-version != ''
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3.2.0
+        with:
+          version: ${{ inputs.supabase-cli-version }}
+      # A fresh Postgres applies every migration in order: a migration that fails here fails on staging and production.
+      - name: Start local Supabase (Postgres only)
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          for attempt in 1 2 3; do
+            $SB start -x studio,logflare,vector,imgproxy,edge-runtime,postgres-meta,mailpit,realtime,storage-api,postgrest,gotrue,kong,supavisor && break
+            echo "::warning::supabase start failed (attempt $attempt); cleaning up and retrying"
+            $SB stop --no-backup || true
+            sleep 10
+            [ "$attempt" = 3 ] && exit 1
+          done
+          $SB status -o env | grep -E '^DB_URL=' | sed -E 's/="(.*)"$/=\1/' >> "$GITHUB_ENV"
+      - name: Database tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.database }}
+      - if: always()
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          $SB stop --no-backup || true
+
+  integration:
+    name: Integration tests (local Supabase)
+    needs: gate
+    if: inputs.integration != '' && needs.gate.outputs.tested != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci; fi
+      - if: inputs.supabase-cli-version != ''
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3.2.0
+        with:
+          version: ${{ inputs.supabase-cli-version }}
+      - name: Start local Supabase
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          for attempt in 1 2 3; do
+            $SB start -x studio,logflare,vector,imgproxy,edge-runtime,postgres-meta,mailpit,realtime,supavisor && break
+            echo "::warning::supabase start failed (attempt $attempt); cleaning up and retrying"
+            $SB stop --no-backup || true
+            sleep 10
+            [ "$attempt" = 3 ] && exit 1
+          done
+          $SB status -o env | grep -E '^(API_URL|ANON_KEY|SERVICE_ROLE_KEY|DB_URL)=' | sed -E 's/="(.*)"$/=\1/' >> "$GITHUB_ENV"
+      - name: Integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.integration }}
+      - if: always()
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          $SB stop --no-backup || true
+
+  e2e:
+    name: e2e (${{ matrix.shard }}/${{ inputs.e2e-shards }})
+    needs: gate
+    if: inputs.e2e != '' && needs.gate.outputs.tested != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.e2e-timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.gate.outputs.shards) }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ inputs.e2e-shards }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then pnpm install --frozen-lockfile; else npm ci; fi
+      - if: inputs.e2e-supabase && inputs.supabase-cli-version != ''
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3.2.0
+        with:
+          version: ${{ inputs.supabase-cli-version }}
+      # Mailpit stays: products read sign-up and password emails from it in their e2e suites.
+      - name: Start local Supabase
+        if: inputs.e2e-supabase
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          for attempt in 1 2 3; do
+            $SB start -x studio,logflare,vector,imgproxy,edge-runtime,postgres-meta && break
+            echo "::warning::supabase start failed (attempt $attempt); cleaning up and retrying"
+            $SB stop --no-backup || true
+            sleep 10
+            [ "$attempt" = 3 ] && exit 1
+          done
+          $SB status -o env | grep -E '^(API_URL|ANON_KEY|SERVICE_ROLE_KEY|DB_URL)=' | sed -E 's/="(.*)"$/=\1/' >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json') }}
+      - if: inputs.next-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json') }}-${{ github.sha }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json') }}-
+      - name: End-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.e2e }}
+      - if: always() && inputs.e2e-supabase
+        run: |
+          SB="supabase"; [ -z "${{ inputs.supabase-cli-version }}" ] && SB="${{ inputs.package-manager }} exec supabase"
+          $SB stop --no-backup || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: e2e-report-${{ matrix.shard }}
+          path: ${{ inputs.e2e-report-path }}
+          retention-days: 7
